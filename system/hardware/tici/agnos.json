@@ -67,13 +67,12 @@
   },
   {
     "name": "system",
-    "url": "https://www.dropbox.com/scl/fi/gjhc393yvcza4etsv67us/system3.img.xz?rlkey=yrrwvlw2tljrwu5ullicc1oot&st=9d6ptx4x&dl=1",
-    "hash": "f144e595f907b06b7d583c72563358f49567817de5dfa4f07207e1aeab9af7fd",
-    "hash_raw": "f144e595f907b06b7d583c72563358f49567817de5dfa4f07207e1aeab9af7fd",
+    "url": "https://www.dropbox.com/scl/fi/kf8be07fgdjgcv9ic482y/system7.img.xz?rlkey=0e6jwij46tndpaeu33jx65tma&st=g9g0ph65&dl=1",
+    "hash": "1b71fd1835610e46c9d3f2d13e389108df4777308a6128e5b794b6875c91012e",
+    "hash_raw": "1b71fd1835610e46c9d3f2d13e389108df4777308a6128e5b794b6875c91012e",
     "size": 5368709120,
     "sparse": false,
     "full_check": false,
-    "has_ab": true,
-    "ondevice_hash": "242aa5adad1c04e1398e00e2440d1babf962022eb12b89adf2e60ee3068946e7"
+    "has_ab": true
   }
 ]

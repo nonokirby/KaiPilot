@@ -425,7 +425,7 @@ class CarInterface(CarInterfaceBase):
     elif candidate in (CAR.BUICK_LACROSSE, CAR.BUICK_LACROSSE_ASCM, CAR.BUICK_LACROSSE_ASCM_19US):
       CarInterfaceBase.configure_torque_tune(CAR.BUICK_LACROSSE, ret.lateralTuning)
       if candidate == CAR.BUICK_LACROSSE_ASCM_19US:
-        ret.minSteerSpeed = 37 * CV.MPH_TO_MS
+        ret.minSteerSpeed = 27 * CV.MPH_TO_MS
 
     elif candidate == CAR.CADILLAC_ESCALADE:
       ret.minEnableSpeed = -1.  # engage speed is decided by pcm
@@ -640,7 +640,7 @@ class CarInterface(CarInterfaceBase):
       ret.longitudinalTuning.kpBP = [0.0, 5.0, 15.0, 35.0]
       ret.longitudinalTuning.kpV = [0.02, 0.03, 0.028, 0.022]
       ret.longitudinalTuning.kiBP = [0.0, 5.0, 15.0, 35.0]
-      ret.longitudinalTuning.kiV = [0.28, 0.26, 0.20, 0.16]
+      ret.longitudinalTuning.kiV = [0.20, 0.18, 0.13, 0.08]
 
     elif candidate in CC_ONLY_CAR and not ret.enableGasInterceptorDEPRECATED:
       ret.flags |= GMFlags.CC_LONG.value
@@ -691,6 +691,7 @@ class CarInterface(CarInterfaceBase):
       ret.safetyConfigs[0].safetyParam |= GMSafetyFlags.FLAG_GM_REMOTE_START_BOOTS_COMMA.value
 
     volt_stock_friction_brake_safety = (
+      ret.openpilotLongitudinalControl and
       (gm_auto_hold or volt_one_pedal_mode) and
       candidate in {
         CAR.CHEVROLET_VOLT,
@@ -701,12 +702,14 @@ class CarInterface(CarInterfaceBase):
     )
     if volt_stock_friction_brake_safety:
       # Reuse the paddle-scheduler safety bit as a Volt stock friction-brake
-      # marker on non-pedal paths. Both auto hold and one-pedal can run while
-      # OP longitudinal is configured but not currently active, so the bit must
-      # be present regardless of the current long-control mode.
+      # marker on non-pedal paths. Auto hold and one-pedal can run while OP
+      # longitudinal is configured but not currently active, so the bit must
+      # be present regardless of the current long-control mode. Do not expose
+      # the path at all when OP long is disabled in CarParams.
       ret.safetyConfigs[0].safetyParam |= GMSafetyFlags.FLAG_GM_PANDA_PADDLE_SCHED.value
 
     volt_stock_one_pedal_safety = (
+      ret.openpilotLongitudinalControl and
       volt_one_pedal_mode and
       candidate in {
         CAR.CHEVROLET_VOLT,
@@ -719,6 +722,7 @@ class CarInterface(CarInterfaceBase):
       # Reuse the 3D1 scheduler bit as a Volt one-pedal marker on non-pedal
       # ACC paths. The bit is ignored by the actual 3D1 scheduler unless the
       # car is on a pedal-long CC-only path, so this stays isolated from Bolt.
+      # Do not expose the path at all when OP long is disabled in CarParams.
       ret.safetyConfigs[0].safetyParam |= GMSafetyFlags.FLAG_GM_PANDA_3D1_SCHED.value
 
     use_panda_3d1_sched = (

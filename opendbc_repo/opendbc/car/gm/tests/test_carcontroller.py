@@ -54,10 +54,12 @@ from opendbc.car.gm.carcontroller import (
   get_acc_dashboard_status_active,
   get_stock_cc_active_for_cancel,
   shape_bolt_acc_pedal_low_speed_friction,
+  shape_truck_friction_brake,
   shape_truck_positive_accel,
   should_use_fixed_stopping_brake,
   should_activate_auto_hold,
   should_activate_volt_one_pedal,
+  should_send_acc_2cd,
   should_send_adas_status,
   should_send_stock_long_cancel,
   should_spoof_dash_speed,
@@ -356,6 +358,19 @@ def test_live_camera_path_does_not_send_pt_keepalive():
   assert get_adas_keepalive_step(cp, is_kaofui_car=True) is None
 
 
+def test_acc_2cd_replacement_only_used_with_live_camera_path():
+  assert should_send_acc_2cd(SimpleNamespace(
+    carFingerprint=CAR.CHEVROLET_TRAILBLAZER, networkLocation=CarParams.NetworkLocation.fwdCamera, flags=0))
+  assert not should_send_acc_2cd(SimpleNamespace(
+    carFingerprint=CAR.CHEVROLET_TRAILBLAZER, networkLocation=CarParams.NetworkLocation.fwdCamera, flags=GMFlags.NO_CAMERA.value))
+  assert not should_send_acc_2cd(SimpleNamespace(
+    carFingerprint=CAR.CHEVROLET_TRAILBLAZER, networkLocation=CarParams.NetworkLocation.gateway, flags=0))
+  assert not should_send_acc_2cd(SimpleNamespace(
+    carFingerprint=CAR.CHEVROLET_TRAILBLAZER_CC, networkLocation=CarParams.NetworkLocation.fwdCamera, flags=0))
+  assert not should_send_acc_2cd(SimpleNamespace(
+    carFingerprint=CAR.CHEVROLET_BLAZER, networkLocation=CarParams.NetworkLocation.fwdCamera, flags=0))
+
+
 def test_ascm_int_cars_do_not_send_radar_status():
   common = {
     "networkLocation": CarParams.NetworkLocation.fwdCamera,
@@ -411,7 +426,7 @@ def test_volt_auto_hold_requires_toggle_supported_non_cc_only_volt_and_stock_saf
     ),
     True,
   )
-  assert supports_volt_auto_hold(
+  assert not supports_volt_auto_hold(
     SimpleNamespace(
       carFingerprint=CAR.CHEVROLET_VOLT,
       openpilotLongitudinalControl=False,
@@ -420,7 +435,7 @@ def test_volt_auto_hold_requires_toggle_supported_non_cc_only_volt_and_stock_saf
     ),
     True,
   )
-  assert supports_volt_auto_hold(
+  assert not supports_volt_auto_hold(
     SimpleNamespace(
       carFingerprint=CAR.CHEVROLET_VOLT_2019,
       openpilotLongitudinalControl=False,
@@ -464,6 +479,7 @@ def test_volt_one_pedal_requires_toggle_supported_volt_stock_safety_and_ev_trans
   assert supports_volt_one_pedal(
     SimpleNamespace(
       carFingerprint=CAR.CHEVROLET_VOLT_CAMERA,
+      openpilotLongitudinalControl=True,
       safetyConfigs=stock_safety,
       transmissionType=structs.CarParams.TransmissionType.direct,
     ),
@@ -472,6 +488,7 @@ def test_volt_one_pedal_requires_toggle_supported_volt_stock_safety_and_ev_trans
   assert not supports_volt_one_pedal(
     SimpleNamespace(
       carFingerprint=CAR.CHEVROLET_VOLT_CAMERA,
+      openpilotLongitudinalControl=True,
       safetyConfigs=no_safety,
       transmissionType=structs.CarParams.TransmissionType.direct,
     ),
@@ -480,6 +497,7 @@ def test_volt_one_pedal_requires_toggle_supported_volt_stock_safety_and_ev_trans
   assert not supports_volt_one_pedal(
     SimpleNamespace(
       carFingerprint=CAR.CHEVROLET_VOLT_CC,
+      openpilotLongitudinalControl=True,
       safetyConfigs=stock_safety,
       transmissionType=structs.CarParams.TransmissionType.direct,
     ),
@@ -488,6 +506,7 @@ def test_volt_one_pedal_requires_toggle_supported_volt_stock_safety_and_ev_trans
   assert not supports_volt_one_pedal(
     SimpleNamespace(
       carFingerprint=CAR.CHEVROLET_VOLT_CAMERA,
+      openpilotLongitudinalControl=True,
       safetyConfigs=stock_safety,
       transmissionType=structs.CarParams.TransmissionType.automatic,
     ),
@@ -496,6 +515,16 @@ def test_volt_one_pedal_requires_toggle_supported_volt_stock_safety_and_ev_trans
   assert not supports_volt_one_pedal(
     SimpleNamespace(
       carFingerprint=CAR.CHEVROLET_VOLT_CAMERA,
+      openpilotLongitudinalControl=False,
+      safetyConfigs=stock_safety,
+      transmissionType=structs.CarParams.TransmissionType.direct,
+    ),
+    True,
+  )
+  assert not supports_volt_one_pedal(
+    SimpleNamespace(
+      carFingerprint=CAR.CHEVROLET_VOLT_CAMERA,
+      openpilotLongitudinalControl=True,
       safetyConfigs=stock_safety,
       transmissionType=structs.CarParams.TransmissionType.direct,
     ),
@@ -799,7 +828,7 @@ def test_calc_pedal_command_keeps_strong_positive_requests_responsive():
 def test_shape_truck_positive_accel_softens_small_highway_requests():
   shaped = shape_truck_positive_accel(0.12, 26.0, True)
 
-  assert 0.09 < shaped < 0.10
+  assert 0.08 < shaped < 0.095
 
 
 def test_shape_truck_positive_accel_keeps_mid_follow_requests_available():
@@ -830,6 +859,21 @@ def test_shape_truck_positive_accel_does_not_relax_without_speed_error():
   no_error = shape_truck_positive_accel(0.28, 26.0, True, lead_visible=True, set_speed_error=0.0)
 
   assert no_error == base
+
+
+def test_shape_truck_friction_brake_suppresses_boundary_chatter():
+  assert shape_truck_friction_brake(14, -0.3, False, False) == (0, False)
+
+
+def test_shape_truck_friction_brake_uses_hysteresis_once_engaged():
+  assert shape_truck_friction_brake(25, -0.3, False, False) == (25, True)
+  assert shape_truck_friction_brake(14, -0.3, False, True) == (14, True)
+  assert shape_truck_friction_brake(8, -0.3, False, True) == (0, False)
+
+
+def test_shape_truck_friction_brake_never_delays_meaningful_braking():
+  assert shape_truck_friction_brake(5, -0.65, False, False) == (5, True)
+  assert shape_truck_friction_brake(5, -0.2, True, False) == (5, True)
 
 
 def test_use_interceptor_sng_launch_requires_actual_near_stop():

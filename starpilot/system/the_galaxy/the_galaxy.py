@@ -63,6 +63,7 @@ from openpilot.starpilot.common.maps_catalog import (
 )
 from openpilot.starpilot.common.experimental_state import sync_persist_chill_state, sync_persist_experimental_state
 from openpilot.starpilot.common.favorite_slots import FAVORITE_SLOTS_PARAM, normalize_favorite_slots
+from openpilot.starpilot.common.lateral_delay import full_lateral_delay
 from openpilot.starpilot.common.starpilot_utilities import delete_file, get_lock_status, run_cmd
 from openpilot.starpilot.common.starpilot_variables import ACTIVE_THEME_PATH, ERROR_LOGS_PATH, EXCLUDED_KEYS, LEGACY_STARPILOT_PARAM_RENAMES, MAPS_PATH, MODELS_PATH, RESOURCES_REPO, SCREEN_RECORDINGS_PATH, STOCK_THEME_PATH, THEME_SAVE_PATH,\
                                                            default_ev_tuning_enabled, migrate_cancel_button_controls, update_starpilot_toggles
@@ -76,7 +77,7 @@ from openpilot.starpilot.common.testing_grounds import (
 )
 from openpilot.starpilot.navigation.destination_store import normalize_destination_payload, update_recent_destinations
 from openpilot.starpilot.system.the_galaxy.factory_reset import remove_path as _run_factory_reset_delete
-from openpilot.starpilot.system.the_galaxy import utilities
+from openpilot.starpilot.system.the_galaxy import flm_workspace, utilities
 from openpilot.starpilot.system.the_galaxy.update_recovery import inspect_interrupted_update, public_recovery_status, recover_interrupted_update
 
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
@@ -84,6 +85,7 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 GITLAB_API = "https://gitlab.com/api/v4"
 GITLAB_SUBMISSIONS_PROJECT_ID = "71992109"
 GITLAB_TOKEN = os.environ.get("GITLAB_TOKEN", "")
+LEGACY_LATERAL_METHOD_API_PREFIX = "/api/" + "".join(("f", "t", "m"))
 
 GALAXY_DEPS_PATH = "/data/galaxy_deps"
 LEGACY_GALAXY_DEPS_PATH = "/data/" + "".join(chr(code) for code in (112, 111, 110, 100)) + "_deps"
@@ -113,6 +115,17 @@ _TESTING_GROUND_CUSTOM_RESERVED_INTERVAL_S = 15.0
 _TESTING_GROUND_CUSTOM_RESERVED_PM = None
 _TESTING_GROUND_CUSTOM_RESERVED_LOCK = threading.Lock()
 _TESTING_GROUND_CUSTOM_RESERVED_LAST_PUBLISH_MONO = 0.0
+PANDA_FIRMWARE_TOGGLE_KEYS = {"IgnoreIgnitionLine", "RemoteStartBootsComma", "HKGRemoteStartBootsComma"}
+PANDA_FIRMWARE_CONFIRMATION_FIELD = "confirmedPandaFirmwareFlash"
+_PANDA_FLASH_REBOOT_LOCK = threading.Lock()
+
+
+def _flash_panda_then_reboot() -> None:
+  with _PANDA_FLASH_REBOOT_LOCK:
+    params_memory.put_bool("FlashPanda", True)
+    while params_memory.get_bool("FlashPanda"):
+      time.sleep(0.1)
+    HARDWARE.reboot()
 
 
 def _is_comma_device_runtime() -> bool:
@@ -132,6 +145,13 @@ def _is_comma_device_runtime() -> bool:
     with open(model_path) as f:
       model = f.read().strip("\x00").lower()
     return "comma " in model
+  except Exception:
+    return False
+
+
+def _raylib_ui_toggle_affects_device() -> bool:
+  try:
+    return HARDWARE.get_device_type() in ("tici", "tizi")
   except Exception:
     return False
 
@@ -387,6 +407,18 @@ class ParamsCompat:
     self._put_single(self._key(key), value)
 
   def put_bool(self, key, value):
+    if key == "LeadIndicator":
+      enabled = bool(value)
+      self._params.put_bool("LeadIndicator", enabled)
+      self._params.put_bool("HideLeadMarker", not enabled)
+      return
+
+    if key == "HideLeadMarker":
+      hidden = bool(value)
+      self._params.put_bool("HideLeadMarker", hidden)
+      self._params.put_bool("LeadIndicator", not hidden)
+      return
+
     self._params.put_bool(self._key(key), bool(value))
 
   def remove(self, key):
@@ -504,6 +536,8 @@ MAPS_CANCEL_DOWNLOAD_PARAM = "CancelDownloadMaps"
 
 
 def _get_galaxy_dir():
+  if override := os.getenv("SP_GALAXY_DIR"):
+    return Path(override)
   return Path(Paths.comma_home()) / "starpilot" / "data" / "galaxy" if PC else Path("/data/galaxy")
 
 
@@ -667,7 +701,7 @@ FINGERPRINT_MAKE_TO_VALUES_DIR = {
 _FINGERPRINT_CARDOCS_RE = re.compile(r'\w*CarDocs\(\s*"([^"]+)"')
 _FINGERPRINT_PLATFORM_RE = re.compile(r'(\w+)\s*=\s*\w+\s*\(\s*\[([\s\S]*?)\]\s*,')
 _FINGERPRINT_PLATFORM_NAME_RE = re.compile(r'^[A-Z0-9_]+$')
-_FINGERPRINT_VALID_NAME_RE = re.compile(r'^[A-Za-z0-9 \u0160.()\-]+$')
+_FINGERPRINT_VALID_NAME_RE = re.compile(r'^[A-Za-z0-9 \u0160.(),&\-]+$')
 
 _openpilot_root_cache = None
 _fingerprint_catalog_cache = None
@@ -679,6 +713,9 @@ _FAST_UPDATE_REBOOT_NOTICE_SECONDS = 6.0
 _FAST_UPDATE_FETCH_TIMEOUT_S = 60
 _FAST_BRANCH_SWITCH_FETCH_TIMEOUT_S = 60
 _FAST_ROLLBACK_FETCH_TIMEOUT_S = 60
+_AGNOS_MANIFEST_PATH = "system/hardware/tici/agnos.json"
+_AGNOS_REMOTE_MANIFEST_TIMEOUT_S = 8
+_AGNOS_UPDATE_ESTIMATED_DOWNLOAD_MB = 900
 _GIT_PROGRESS_PERCENT_RE = re.compile(r'([A-Za-z][A-Za-z /_-]+):\s*([0-9]{1,3})%')
 _GIT_SUBMODULE_SECTION_RE = re.compile(r'^\s*\[submodule\s+"[^"]+"\]\s*$', re.MULTILINE)
 _ROLLBACK_REF = "refs/starpilot/rollback"
@@ -715,6 +752,7 @@ _fast_update_state = {
 
 _FACTORY_RESET_WIPE_PATHS = [
   "/data/params",
+  "/cache/starpilot/params",
   "/cache/params",
   "/data/media/0/realdata",
   "/data/media/0/realdata_HD",
@@ -811,6 +849,7 @@ _TROUBLESHOOT_CEM_KEYS = [
 
 _TROUBLESHOOT_ADVANCED_LATERAL_KEYS = [
   "AdvancedLateralTune",
+  "UseAutoSteerDelay",
   "SteerDelay",
   "SteerFriction",
   "SteerOffset",
@@ -1240,6 +1279,179 @@ def _is_deferred_tls_error(exception):
     return not _remote_git_check_allowed()
 
   return False
+
+def _get_remote_branch_commit(repo_path, branch):
+  remote_commit = ""
+  remote_error = ""
+  branch_name = str(branch or "").strip()
+  if not branch_name or not _remote_git_check_allowed():
+    return remote_commit, remote_error
+
+  try:
+    remote_raw = _git_stdout(repo_path, ["ls-remote", "--heads", "origin", branch_name], timeout=20)
+    if remote_raw:
+      remote_commit = remote_raw.split()[0]
+  except Exception as exception:
+    if not _is_deferred_tls_error(exception):
+      remote_error = str(exception)
+
+  return remote_commit, remote_error
+
+def _base_agnos_update_status(target_branch="", local_commit="", remote_commit=""):
+  return {
+    "available": False,
+    "checked": False,
+    "targetBranch": str(target_branch or "").strip(),
+    "manifestPath": _AGNOS_MANIFEST_PATH,
+    "localCommit": str(local_commit or "").strip(),
+    "remoteCommit": str(remote_commit or "").strip(),
+    "localManifestHash": "",
+    "remoteManifestHash": "",
+    "changedPartitions": [],
+    "estimatedDownloadMb": _AGNOS_UPDATE_ESTIMATED_DOWNLOAD_MB,
+    "warnings": [
+      "This AGNOS firmware update will take much longer than a normal software update.",
+      "You must be able to physically access the device to press the on-device update button.",
+      "It downloads about 900 MB of data, so Wi-Fi is recommended.",
+    ],
+    "source": "",
+    "error": "",
+  }
+
+def _canonical_agnos_manifest_text(manifest_text):
+  text = str(manifest_text or "").strip()
+  if not text:
+    return ""
+
+  try:
+    return json.dumps(json.loads(text), sort_keys=True, separators=(",", ":"))
+  except Exception:
+    return text
+
+def _agnos_manifest_hash(manifest_text):
+  canonical = _canonical_agnos_manifest_text(manifest_text)
+  if not canonical:
+    return ""
+  return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+def _agnos_partition_fingerprints(manifest_text):
+  try:
+    manifest = json.loads(str(manifest_text or ""))
+  except Exception:
+    return {}
+
+  if not isinstance(manifest, list):
+    return {}
+
+  partitions = {}
+  for item in manifest:
+    if not isinstance(item, dict):
+      continue
+
+    name = str(item.get("name") or "").strip()
+    if not name:
+      continue
+
+    partitions[name] = {
+      "hash": str(item.get("hash") or ""),
+      "hashRaw": str(item.get("hash_raw") or ""),
+      "url": str(item.get("url") or ""),
+      "size": str(item.get("size") or ""),
+    }
+
+  return partitions
+
+def _agnos_changed_partitions(local_manifest_text, remote_manifest_text):
+  local_partitions = _agnos_partition_fingerprints(local_manifest_text)
+  remote_partitions = _agnos_partition_fingerprints(remote_manifest_text)
+  partition_names = sorted(set(local_partitions) | set(remote_partitions))
+  return [
+    name for name in partition_names
+    if local_partitions.get(name) != remote_partitions.get(name)
+  ]
+
+def _git_show_file_text(repo_path, ref, file_path):
+  safe_ref = str(ref or "").strip()
+  if not safe_ref:
+    raise RuntimeError("Missing git ref")
+  return _git_stdout(repo_path, ["show", f"{safe_ref}:{file_path}"], timeout=10)
+
+def _github_raw_file_url(origin_remote, ref, file_path):
+  remote = utilities.normalize_github_remote(origin_remote)
+  if not remote:
+    return ""
+
+  slug = remote.split("https://github.com/", 1)[1]
+  parts = slug.split("/", 1)
+  if len(parts) != 2 or not parts[0] or not parts[1]:
+    return ""
+
+  owner = quote(parts[0], safe="")
+  repo = quote(parts[1], safe="")
+  quoted_ref = quote(str(ref or "").strip(), safe="")
+  quoted_path = "/".join(quote(part, safe="") for part in str(file_path or "").split("/") if part)
+  if not quoted_ref or not quoted_path:
+    return ""
+
+  return f"https://raw.githubusercontent.com/{owner}/{repo}/{quoted_ref}/{quoted_path}"
+
+def _fetch_remote_file_text(origin_remote, ref, file_path):
+  raw_url = _github_raw_file_url(origin_remote, ref, file_path)
+  if not raw_url:
+    raise RuntimeError("AGNOS manifest comparison is only available for GitHub remotes when the remote commit is not available locally.")
+
+  response = requests.get(raw_url, timeout=_AGNOS_REMOTE_MANIFEST_TIMEOUT_S)
+  response.raise_for_status()
+  return response.text, raw_url
+
+def _build_agnos_update_status(repo_path, origin_remote, local_commit, remote_commit, target_branch=""):
+  status = _base_agnos_update_status(target_branch, local_commit, remote_commit)
+  safe_local_commit = str(local_commit or "").strip()
+  safe_remote_commit = str(remote_commit or "").strip()
+
+  if not safe_local_commit or not safe_remote_commit:
+    status["error"] = "Missing commit information for AGNOS manifest comparison."
+    return status
+
+  if safe_local_commit == safe_remote_commit:
+    status["checked"] = True
+    status["source"] = "same-commit"
+    return status
+
+  try:
+    local_manifest_text = _git_show_file_text(repo_path, safe_local_commit, _AGNOS_MANIFEST_PATH)
+  except Exception as exception:
+    status["error"] = f"Unable to read local AGNOS manifest: {exception}"
+    return status
+
+  remote_manifest_text = ""
+  if _git_has_commit(repo_path, safe_remote_commit):
+    try:
+      remote_manifest_text = _git_show_file_text(repo_path, safe_remote_commit, _AGNOS_MANIFEST_PATH)
+      status["source"] = "git"
+    except Exception as exception:
+      status["error"] = f"Unable to read remote AGNOS manifest from git: {exception}"
+      return status
+  else:
+    try:
+      remote_manifest_text, raw_url = _fetch_remote_file_text(origin_remote, safe_remote_commit, _AGNOS_MANIFEST_PATH)
+      status["source"] = raw_url
+    except Exception as exception:
+      status["error"] = f"Unable to fetch remote AGNOS manifest: {exception}"
+      return status
+
+  local_hash = _agnos_manifest_hash(local_manifest_text)
+  remote_hash = _agnos_manifest_hash(remote_manifest_text)
+  changed_partitions = _agnos_changed_partitions(local_manifest_text, remote_manifest_text)
+  status.update({
+    "checked": True,
+    "available": bool(local_hash and remote_hash and local_hash != remote_hash),
+    "localManifestHash": local_hash,
+    "remoteManifestHash": remote_hash,
+    "changedPartitions": changed_partitions,
+    "error": "",
+  })
+  return status
 
 def _build_shallow_fetch_args(branch):
   return [
@@ -1673,6 +1885,7 @@ def _collect_fast_update_info(include_remote=True):
   origin_remote = ""
   commits_url = ""
   rollback_data = _load_rollback_target(repo_path)
+  agnos_update = _base_agnos_update_status()
 
   try:
     branch = _git_stdout(repo_path, ["rev-parse", "--abbrev-ref", "HEAD"])
@@ -1692,7 +1905,11 @@ def _collect_fast_update_info(include_remote=True):
       "originRemote": origin_remote,
       "commitsUrl": commits_url,
       **rollback_data,
+      "agnosUpdate": agnos_update,
     }
+
+  agnos_update["targetBranch"] = branch
+  agnos_update["localCommit"] = local_commit
 
   if origin_remote:
     remote = origin_remote.strip()
@@ -1711,14 +1928,12 @@ def _collect_fast_update_info(include_remote=True):
         commits_url = f"{remote}/commits/{quote(branch, safe='')}/"
 
   if branch and include_remote and _remote_git_check_allowed():
-    try:
-      remote_raw = _git_stdout(repo_path, ["ls-remote", "--heads", "origin", branch], timeout=20)
-      if remote_raw:
-        remote_commit = remote_raw.split()[0]
-        update_available = bool(local_commit and remote_commit and local_commit != remote_commit)
-    except Exception as exception:
-      if not _is_deferred_tls_error(exception):
-        remote_error = str(exception)
+    remote_commit, remote_error = _get_remote_branch_commit(repo_path, branch)
+    update_available = bool(local_commit and remote_commit and local_commit != remote_commit)
+    if remote_commit:
+      agnos_update = _build_agnos_update_status(repo_path, origin_remote, local_commit, remote_commit, branch)
+  elif not include_remote:
+    agnos_update = _base_agnos_update_status(branch, local_commit, "")
 
   return {
     "repoPath": repo_path,
@@ -1729,6 +1944,7 @@ def _collect_fast_update_info(include_remote=True):
     "remoteError": remote_error,
     "originRemote": origin_remote,
     "commitsUrl": commits_url,
+    "agnosUpdate": agnos_update,
     **rollback_data,
   }
 
@@ -2239,6 +2455,18 @@ def _is_blank_param_raw(raw_value):
     return len(raw_value.strip()) == 0
   return False
 
+def _get_use_old_ui_enabled():
+  if not _raylib_ui_toggle_affects_device():
+    return False
+
+  raw_value = _safe_params_get_live_raw("UseOldUI")
+  if _is_blank_param_raw(raw_value):
+    legacy_raw_value = _safe_params_get_live_raw("TryRaylibUI")
+    if not _is_blank_param_raw(legacy_raw_value):
+      return not _coerce_param_value(legacy_raw_value, bool)
+
+  return _coerce_param_value(raw_value, bool)
+
 def _has_runtime_default_value(key, raw_value):
   if _is_blank_param_raw(raw_value):
     return False
@@ -2272,7 +2500,7 @@ def _get_runtime_default_param_overrides():
         overrides["EVTuning"] = default_ev_tuning_enabled(cp)
 
         car_param_defaults = {
-          "SteerDelay": getattr(cp, "steerActuatorDelay", None),
+          "SteerDelay": full_lateral_delay(getattr(cp, "steerActuatorDelay", 0.0)),
           "SteerRatio": getattr(cp, "steerRatio", None),
           "LongitudinalActuatorDelay": getattr(cp, "longitudinalActuatorDelay", None),
           "StartAccel": getattr(cp, "startAccel", None),
@@ -2317,8 +2545,16 @@ def _get_runtime_default_param_overrides():
   return overrides
 
 def _get_current_param_value(key, value_type, defaults_lookup=None):
+  if key == "UseOldUI":
+    return _get_use_old_ui_enabled()
+  if key == "TryRaylibUI":
+    return _raylib_ui_toggle_affects_device() and not _get_use_old_ui_enabled()
+
   if key == CUSTOM_ACCEL_PROFILE_INITIALIZED_KEY:
     return _get_custom_accel_profile_initialized()
+
+  if key == "LeadIndicator":
+    return _get_lead_indicator_enabled(defaults_lookup)
 
   if key == "IsRHD" and not _safe_params_get_bool("IsRHDOverride"):
     return _safe_params_get_bool("IsRhdDetected")
@@ -2337,6 +2573,17 @@ def _get_current_param_value(key, value_type, defaults_lookup=None):
   if key in ("Model", "DrivingModel") and isinstance(value, str):
     return canonical_model_key(value)
   return value
+
+
+def _get_lead_indicator_enabled(defaults_lookup=None):
+  if defaults_lookup is None:
+    defaults_lookup = _get_default_param_values()
+
+  hide_raw = _safe_params_get_live_raw("HideLeadMarker")
+  if _is_blank_param_raw(hide_raw):
+    hide_raw = defaults_lookup.get("HideLeadMarker", "0")
+
+  return not _coerce_param_value(hide_raw, bool)
 
 
 def _get_custom_accel_profile_initialized():
@@ -2877,6 +3124,12 @@ def _build_troubleshoot_payload():
       "value": _get_fingerprint_snapshot_text(),
       "resettable": False,
     },
+    {
+      "id": "lan_ip",
+      "label": "LAN IP",
+      "value": utilities.get_current_lan_ip() or "Unavailable",
+      "resettable": False,
+    },
     *_get_hardware_snapshot_items(),
     {
       "id": "driving_model",
@@ -3335,7 +3588,7 @@ def _save_longitudinal_maneuver_status(status):
     history = []
   status_copy["history"] = [str(line) for line in history if str(line).strip()][-120:]
   status_copy["updatedAtSec"] = float(status_copy.get("updatedAtSec") or time.monotonic())
-  params.put("LongitudinalManeuverStatus", json.dumps(status_copy, separators=(",", ":")))
+  params.put("LongitudinalManeuverStatus", status_copy)
   return status_copy
 
 def _append_longitudinal_maneuver_history(status, line):
@@ -3464,7 +3717,7 @@ def _save_lateral_maneuver_status(status):
     history = []
   status_copy["history"] = [str(line) for line in history if str(line).strip()][-120:]
   status_copy["updatedAtSec"] = float(status_copy.get("updatedAtSec") or time.monotonic())
-  params.put("LateralManeuverStatus", json.dumps(status_copy, separators=(",", ":")))
+  params.put("LateralManeuverStatus", status_copy)
   return status_copy
 
 
@@ -3536,6 +3789,8 @@ def setup(app):
   def disable_device_settings_asset_cache(response):
     if request.path in {
       "/assets/components/router.js",
+      "/assets/components/home/home.js",
+      "/assets/components/home/home.css",
       "/assets/components/tools/device_settings.js",
       "/assets/components/tools/device_settings.css",
       "/assets/components/tools/device_settings_layout.json",
@@ -3941,6 +4196,26 @@ def setup(app):
       if key not in allowed_keys:
         return jsonify({"error": f"Parameter '{key}' is not editable."}), 403
 
+      if key in {"UseOldUI", "TryRaylibUI"}:
+        enabled = str_val.strip() in ("1", "true", "True")
+        use_old_ui = enabled if key == "UseOldUI" else not enabled
+        updated = {"UseOldUI": use_old_ui, "TryRaylibUI": not use_old_ui}
+        if not _raylib_ui_toggle_affects_device():
+          return jsonify({
+            "message": "Use Old UI is only available on tici/tizi devices.",
+            "updated": {"UseOldUI": False, "TryRaylibUI": False},
+          }), 200
+
+        if params.get_bool("IsOnroad"):
+          return jsonify({"error": "Cannot change Use Old UI while driving."}), 403
+
+        params.put_bool("UseOldUI", use_old_ui)
+        params.put_bool("TryRaylibUI", not use_old_ui)
+        return jsonify({
+          "message": f"{'Old' if use_old_ui else 'Raylib'} UI selected. UI will restart shortly.",
+          "updated": updated,
+        }), 200
+
       # 1. Prevent changing the model or reboot-required toggles while the car is actively driving
       reboot_keys = {"Model", "DrivingModel", "AlwaysOnLateral", "DisableOpenpilotLongitudinal", "ForceTorqueController", "NNFF", "NNFFLite"}
       if key in reboot_keys and params.get_bool("IsOnroad"):
@@ -3958,6 +4233,26 @@ def setup(app):
 
       if key == "AutomaticUpdates" and params.get_bool("IsOnroad"):
         return jsonify({"error": "Cannot change Automatic Updates while driving."}), 403
+
+      if key in PANDA_FIRMWARE_TOGGLE_KEYS and params.get_bool("IsOnroad"):
+        return jsonify({"error": "Cannot flash Panda firmware while driving."}), 403
+      if key in PANDA_FIRMWARE_TOGGLE_KEYS and data.get(PANDA_FIRMWARE_CONFIRMATION_FIELD) is not True:
+        return jsonify({"error": "Panda firmware changes require confirmation before flashing."}), 409
+
+      if key in {"LeadIndicator", "HideLeadMarker"}:
+        enabled = str_val.strip() in ("1", "true", "True")
+        if key == "LeadIndicator":
+          params.put_bool("LeadIndicator", enabled)
+          updated = {"LeadIndicator": enabled, "HideLeadMarker": not enabled}
+        else:
+          params.put_bool("HideLeadMarker", enabled)
+          updated = {"HideLeadMarker": enabled, "LeadIndicator": not enabled}
+
+        update_starpilot_toggles()
+        return jsonify({
+          "message": f"Parameter '{key}' updated successfully.",
+          "updated": updated,
+        }), 200
 
       if key == "AllowImpossibleAcceleration":
         enabled = str_val.strip() in ("1", "true", "True")
@@ -3978,6 +4273,22 @@ def setup(app):
         updated = {key: enabled}
         if enabled:
           other_key = "TruckTuning" if key == "EVTuning" else "EVTuning"
+          params.put_bool(other_key, False)
+          updated[other_key] = False
+
+        update_starpilot_toggles()
+        return jsonify({
+          "message": f"Parameter '{key}' updated successfully.",
+          "updated": updated,
+        }), 200
+
+      if key in {"DynamicPedalsOnUI", "StaticPedalsOnUI"}:
+        enabled = str_val.strip() in ("1", "true", "True")
+        params.put_bool(key, enabled)
+
+        updated = {key: enabled}
+        if enabled:
+          other_key = "StaticPedalsOnUI" if key == "DynamicPedalsOnUI" else "DynamicPedalsOnUI"
           params.put_bool(other_key, False)
           updated[other_key] = False
 
@@ -4185,6 +4496,9 @@ def setup(app):
 
       response = {"message": f"Parameter '{key}' updated successfully."}
       updated = {}
+      if key in PANDA_FIRMWARE_TOGGLE_KEYS:
+        threading.Thread(target=_flash_panda_then_reboot, daemon=True).start()
+        response["message"] = f"Parameter '{key}' updated successfully. Panda flashing started; device will reboot when finished."
       if key == "RemapCancelToDistance" and params.get_bool("RemapCancelToDistance"):
         updated["RemapCancelToDistance"] = True
         response["message"] = "Remap Cancel Button enabled."
@@ -4215,6 +4529,12 @@ def setup(app):
       return _serialize_param_write_value(defaults_lookup.get(request_key)), 200
     if request_key == CUSTOM_ACCEL_PROFILE_INITIALIZED_KEY:
       return _serialize_param_write_value(_get_custom_accel_profile_initialized()), 200
+    if request_key == "LeadIndicator":
+      return _serialize_param_write_value(_get_lead_indicator_enabled()), 200
+    if request_key == "UseOldUI":
+      return ("1" if _get_use_old_ui_enabled() else "0"), 200
+    if request_key == "TryRaylibUI":
+      return ("1" if _raylib_ui_toggle_affects_device() and not _get_use_old_ui_enabled() else "0"), 200
     if request_key == "IsRHD" and not params.get_bool("IsRHDOverride"):
       return ("1" if params.get_bool("IsRhdDetected") else "0"), 200
     value = params.get(request_key) or ""
@@ -4251,7 +4571,11 @@ def setup(app):
       default_val = defaults_lookup.get(key)
 
       try:
-        if t == bool:
+        if key == "UseOldUI":
+          result[key] = False
+        elif key == "TryRaylibUI":
+          result[key] = _raylib_ui_toggle_affects_device()
+        elif t == bool:
           if isinstance(default_val, bytes):
             default_str = default_val.decode("utf-8", errors="replace")
           else:
@@ -4794,7 +5118,8 @@ def setup(app):
     def generate():
       routes = [(path, name) for path in FOOTAGE_PATHS for name in utilities.get_routes_names(path)]
       total = len(routes)
-      yield f"data: {json.dumps({'progress': 0, 'total': total})}\n\n"
+      connect_dongle_id = params.get("StockDongleId", encoding="utf-8") or params.get("DongleId", encoding="utf-8") or ""
+      yield f"data: {json.dumps({'progress': 0, 'total': total, 'connectDongleId': connect_dongle_id})}\n\n"
 
       with ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(utilities.process_route, path, name): (path, name) for path, name in routes}
@@ -5364,6 +5689,151 @@ def setup(app):
       **_serialize_lateral_maneuver_status(status),
     }), 200
 
+  @app.route(f"{LEGACY_LATERAL_METHOD_API_PREFIX}/status", methods=["GET"])
+  @app.route("/api/flm/status", methods=["GET"])
+  def get_flm_status():
+    workspace = flm_workspace.list_workspace()
+    return jsonify({
+      "isOnroad": params.get_bool("IsOnroad"),
+      "status": flm_workspace.read_flm_status(),
+      "activeTrial": workspace.get("activeTrial"),
+      "reports": workspace.get("reports", [])[:10],
+    }), 200
+
+  @app.route(f"{LEGACY_LATERAL_METHOD_API_PREFIX}/analyze", methods=["POST"])
+  @app.route("/api/flm/analyze", methods=["POST"])
+  def start_flm_analysis():
+    if params.get_bool("IsOnroad"):
+      return jsonify({"error": "FLM analysis can only run offroad."}), 409
+
+    data = request.get_json(silent=True) or {}
+    route_names = [str(route).strip() for route in data.get("routes", []) if str(route).strip()]
+    if not route_names:
+      return jsonify({"error": "No routes were selected."}), 400
+
+    started = flm_workspace.start_flm_background_analysis(route_names, FOOTAGE_PATHS)
+    if not started:
+      return jsonify({"error": "Failed to start FLM analysis."}), 500
+
+    return jsonify({
+      "message": f"Started FLM analysis for {len(route_names[:flm_workspace.FLM_ANALYZER_ROUTE_LIMIT])} route(s).",
+      "status": flm_workspace.read_flm_status(),
+    }), 200
+
+  @app.route(f"{LEGACY_LATERAL_METHOD_API_PREFIX}/analyze/stop", methods=["POST"])
+  @app.route("/api/flm/analyze/stop", methods=["POST"])
+  def stop_flm_analysis():
+    stopped = flm_workspace.stop_flm_background_analysis()
+    return jsonify({
+      "message": "Stopped FLM analysis." if stopped else "No active FLM analysis was running.",
+      "stopped": bool(stopped),
+      "status": flm_workspace.read_flm_status(),
+    }), 200
+
+  @app.route(f"{LEGACY_LATERAL_METHOD_API_PREFIX}/report/<report_id>", methods=["GET"])
+  @app.route("/api/flm/report/<report_id>", methods=["GET"])
+  def get_flm_report(report_id):
+    try:
+      return jsonify(flm_workspace.load_report(report_id)), 200
+    except FileNotFoundError:
+      return jsonify({"error": "FLM report not found."}), 404
+
+  @app.route(f"{LEGACY_LATERAL_METHOD_API_PREFIX}/report/<report_id>", methods=["DELETE"])
+  @app.route("/api/flm/report/<report_id>", methods=["DELETE"])
+  def delete_flm_report(report_id):
+    try:
+      return jsonify(flm_workspace.delete_report(report_id)), 200
+    except FileNotFoundError:
+      return jsonify({"error": "FLM report not found."}), 404
+    except RuntimeError as error:
+      return jsonify({"error": str(error)}), 409
+
+  @app.route(f"{LEGACY_LATERAL_METHOD_API_PREFIX}/report/<report_id>/path", methods=["POST"])
+  @app.route("/api/flm/report/<report_id>/path", methods=["POST"])
+  def select_flm_report_path(report_id):
+    data = request.get_json(silent=True) or {}
+    path_key = str(data.get("pathKey") or "").strip()
+    if not path_key:
+      return jsonify({"error": "pathKey is required."}), 400
+
+    try:
+      return jsonify(flm_workspace.select_report_path(report_id, path_key)), 200
+    except FileNotFoundError:
+      return jsonify({"error": "FLM report not found."}), 404
+    except ValueError as error:
+      return jsonify({"error": str(error)}), 400
+
+  @app.route(f"{LEGACY_LATERAL_METHOD_API_PREFIX}/workspace", methods=["GET"])
+  @app.route("/api/flm/workspace", methods=["GET"])
+  def get_flm_workspace():
+    return jsonify(flm_workspace.list_workspace()), 200
+
+  @app.route(f"{LEGACY_LATERAL_METHOD_API_PREFIX}/workspace/clear", methods=["POST"])
+  @app.route("/api/flm/workspace/clear", methods=["POST"])
+  def clear_flm_workspace():
+    try:
+      return jsonify(flm_workspace.clear_workspace()), 200
+    except RuntimeError as error:
+      return jsonify({"error": str(error)}), 409
+
+  @app.route(f"{LEGACY_LATERAL_METHOD_API_PREFIX}/trials/apply", methods=["POST"])
+  @app.route("/api/flm/trials/apply", methods=["POST"])
+  def apply_flm_trial():
+    data = request.get_json(silent=True) or {}
+    report_id = str(data.get("reportId") or "").strip()
+    profile_id = str(data.get("profileId") or "").strip()
+    if not report_id or not profile_id:
+      return jsonify({"error": "Both reportId and profileId are required."}), 400
+
+    try:
+      result = flm_workspace.apply_trial_profile(report_id, profile_id)
+    except FileNotFoundError:
+      return jsonify({"error": "FLM profile not found."}), 404
+    except RuntimeError as error:
+      return jsonify({"error": str(error)}), 409
+
+    return jsonify(result), 200
+
+  @app.route(f"{LEGACY_LATERAL_METHOD_API_PREFIX}/trials/revert", methods=["POST"])
+  @app.route("/api/flm/trials/revert", methods=["POST"])
+  def revert_flm_trial():
+    try:
+      result = flm_workspace.revert_trial_profile()
+    except FileNotFoundError:
+      return jsonify({"error": "No active FLM trial snapshot was found."}), 404
+
+    return jsonify(result), 200
+
+  @app.route(f"{LEGACY_LATERAL_METHOD_API_PREFIX}/trials/accept", methods=["POST"])
+  @app.route("/api/flm/trials/accept", methods=["POST"])
+  def accept_flm_trial():
+    try:
+      result = flm_workspace.accept_trial_as_baseline()
+    except FileNotFoundError:
+      return jsonify({"error": "No active FLM trial was found."}), 404
+
+    return jsonify(result), 200
+
+  @app.route(f"{LEGACY_LATERAL_METHOD_API_PREFIX}/feedback", methods=["POST"])
+  @app.route("/api/flm/feedback", methods=["POST"])
+  def save_flm_feedback():
+    data = request.get_json(silent=True) or {}
+    report_id = str(data.get("reportId") or "").strip()
+    if not report_id:
+      return jsonify({"error": "reportId is required."}), 400
+
+    feedback = {
+      "acceptedDimensions": data.get("acceptedDimensions", []),
+      "ignoredDimensions": data.get("ignoredDimensions", []),
+      "notes": data.get("notes", ""),
+    }
+    try:
+      result = flm_workspace.record_feedback(report_id, feedback)
+    except FileNotFoundError:
+      return jsonify({"error": "FLM report not found."}), 404
+
+    return jsonify(result), 200
+
   @app.route("/api/update/fast/status", methods=["GET"])
   def get_fast_update_status():
     state_data = _get_fast_update_state()
@@ -5439,6 +5909,51 @@ def setup(app):
       "remoteError": remote_error,
       "isOnroad": _safe_params_get_bool("IsOnroad"),
       "running": state_data.get("running", False),
+    }), 200
+
+  @app.route("/api/update/agnos_status", methods=["GET"])
+  def get_agnos_update_status():
+    state_data = _get_fast_update_state()
+    if state_data.get("running", False):
+      return jsonify({"error": "Cannot check AGNOS update status while an update action is running."}), 409
+
+    repo_path = str(_get_openpilot_root())
+    try:
+      current_branch = _git_stdout(repo_path, ["rev-parse", "--abbrev-ref", "HEAD"])
+      local_commit = _git_stdout(repo_path, ["rev-parse", "HEAD"])
+      origin_remote = _git_stdout(repo_path, ["config", "--get", "remote.origin.url"])
+    except Exception as exception:
+      return jsonify({"error": str(exception)}), 500
+
+    target_branch = str(request.args.get("branch") or current_branch or "").strip()
+    if not target_branch:
+      return jsonify({"error": "Missing target branch."}), 400
+    if not _is_valid_git_branch_name(repo_path, target_branch):
+      return jsonify({"error": "Invalid branch name."}), 400
+    if not _remote_git_check_allowed():
+      agnos_update = _base_agnos_update_status(target_branch, local_commit, "")
+      agnos_update["error"] = "Remote checks are deferred until system time is valid."
+      return jsonify({
+        "currentBranch": current_branch,
+        "targetBranch": target_branch,
+        "localCommit": local_commit,
+        "remoteCommit": "",
+        "agnosUpdate": agnos_update,
+      }), 200
+
+    remote_commit, remote_error = _get_remote_branch_commit(repo_path, target_branch)
+    if not remote_commit:
+      agnos_update = _base_agnos_update_status(target_branch, local_commit, "")
+      agnos_update["error"] = remote_error or f"Remote branch '{target_branch}' was not found."
+    else:
+      agnos_update = _build_agnos_update_status(repo_path, origin_remote, local_commit, remote_commit, target_branch)
+
+    return jsonify({
+      "currentBranch": current_branch,
+      "targetBranch": target_branch,
+      "localCommit": local_commit,
+      "remoteCommit": remote_commit,
+      "agnosUpdate": agnos_update,
     }), 200
 
   @app.route("/api/update/fast", methods=["POST"])
@@ -6724,14 +7239,17 @@ def main():
   threading.Thread(target=_testing_ground_custom_reserved_worker, daemon=True).start()
 
   # Desktop-only debug mode. On-device must stay on 8082 to match Galaxy FRP routing.
-  debug = not _is_comma_device_runtime()
-  port = 8083 if debug else 8082
+  on_device = _is_comma_device_runtime()
+  debug = False if on_device else os.getenv("SP_GALAXY_DEBUG", "1").lower() in {"1", "true", "yes", "on"}
+  port = 8082 if on_device else int(os.getenv("SP_GALAXY_PORT", "8083"))
+  host = "0.0.0.0" if on_device else os.getenv("SP_GALAXY_HOST", "0.0.0.0")
+  use_reloader = False if on_device else os.getenv("SP_GALAXY_RELOAD", "0" if not debug else "1").lower() in {"1", "true", "yes", "on"}
 
   if debug:
     print("\"The Galaxy\" is not running on a comma device, enabling debug mode")
 
   app.secret_key = secrets.token_hex(32)
-  app.run(host="0.0.0.0", port=port, debug=debug)
+  app.run(host=host, port=port, debug=debug, use_reloader=use_reloader)
 
 if __name__ == "__main__":
   main()

@@ -45,6 +45,21 @@ def get_bolt_acc_pedal_friction_bias(output_accel, a_target, v_ego):
   return float(min(authority_gap * 0.30, max_bias) * speed_factor)
 
 
+def get_bolt_acc_pedal_friction_floor(a_target, v_ego, pedal_regen_limit):
+  if v_ego <= 5.0 or a_target >= (pedal_regen_limit - 0.05):
+    return None
+
+  friction_request = max(0.0, pedal_regen_limit - a_target)
+  if friction_request <= 0.10:
+    return None
+
+  speed_factor = interp(v_ego, [5.0, 8.0, 12.0, 18.0, 25.0], [0.0, 0.45, 0.75, 0.90, 1.0])
+  demand_factor = interp(friction_request, [0.10, 0.25, 0.50, 0.90, 1.30], [0.0, 0.22, 0.50, 0.78, 1.0])
+  floor_fraction = float(clip(speed_factor * demand_factor, 0.0, 1.0))
+
+  return float(pedal_regen_limit - (friction_request * floor_fraction))
+
+
 def get_bolt_acc_pedal_feedforward_gain(feedforward_gain, a_target, v_ego, pedal_regen_limit, last_output_accel):
   effective_gain = feedforward_gain
   if a_target >= 0.0:
@@ -214,7 +229,7 @@ class LongControl:
     if not preserve_stop_release:
       self.stop_release_counter = 0
 
-  def _stop_release_ready(self, CS, a_target, should_stop, starpilot_toggles):
+  def _stop_release_ready(self, CS, a_target, should_stop, has_lead, starpilot_toggles):
     if self.long_control_state != LongCtrlState.stopping:
       self.stop_release_counter = 0
       return True
@@ -224,6 +239,10 @@ class LongControl:
       return False
 
     if CS.vEgo > starpilot_toggles.vEgoStarting:
+      self.stop_release_counter = int(round(STOPPING_RELEASE_HYSTERESIS / DT_CTRL))
+      return True
+
+    if has_lead and a_target > STOPPING_RELEASE_MIN_ACCEL:
       self.stop_release_counter = int(round(STOPPING_RELEASE_HYSTERESIS / DT_CTRL))
       return True
 
@@ -308,7 +327,8 @@ class LongControl:
       return
     if self.last_output_accel <= 0.10:
       return
-    if a_target > 0.03:
+    light_accel_threshold = float(interp(CS.vEgo, [8.0, 15.0, 25.0], [0.03, 0.06, 0.10]))
+    if a_target > light_accel_threshold:
       return
     if CS.vEgo <= NEGATIVE_TARGET_CREEP_GUARD_SPEED and a_target > -NEGATIVE_TARGET_CREEP_GUARD_DECEL:
       return
@@ -321,7 +341,7 @@ class LongControl:
     if authority_mismatch <= 0.08 and error > -0.08:
       return
 
-    target_factor = float(interp(a_target, [-0.30, -0.10, -0.02, 0.03], [0.20, 0.35, 0.60, 0.85]))
+    target_factor = float(interp(a_target, [-0.30, -0.10, -0.02, light_accel_threshold], [0.20, 0.35, 0.60, 0.98]))
     if error < -0.20:
       target_factor *= 0.75
     self.pid.i *= target_factor
@@ -336,8 +356,12 @@ class LongControl:
 
     authority_gap = max(0.0, abs(a_target) - abs(output_accel))
     if self.is_bolt_acc_pedal_friction_car:
+      pedal_regen_limit = float(interp(CS.vEgo, BOLT_ACC_PEDAL_REGEN_LIMIT_BP, BOLT_ACC_PEDAL_REGEN_LIMIT_V))
       bias = get_bolt_acc_pedal_friction_bias(output_accel, a_target, CS.vEgo)
-      return output_accel - float(bias)
+      floor = get_bolt_acc_pedal_friction_floor(a_target, CS.vEgo, pedal_regen_limit)
+      if floor is not None:
+        bias = max(bias, output_accel - floor)
+      return output_accel - float(max(bias, 0.0))
 
     if authority_gap <= 0.40:
       return output_accel
@@ -372,12 +396,12 @@ class LongControl:
     )
     return a_target * effective_gain
 
-  def update(self, active, CS, a_target, should_stop, accel_limits, starpilot_toggles):
+  def update(self, active, CS, a_target, should_stop, accel_limits, starpilot_toggles, has_lead=False):
     """Update longitudinal control. This updates the state machine and runs a PID loop"""
     self.pid.neg_limit = accel_limits[0]
     self.pid.pos_limit = accel_limits[1]
 
-    allow_stopping_release = self._stop_release_ready(CS, a_target, should_stop, starpilot_toggles)
+    allow_stopping_release = self._stop_release_ready(CS, a_target, should_stop, has_lead, starpilot_toggles)
     self.long_control_state = long_control_state_trans(self.CP, active, self.long_control_state, CS.vEgo,
                                                        should_stop, CS.brakePressed,
                                                        CS.cruiseState.standstill, starpilot_toggles,

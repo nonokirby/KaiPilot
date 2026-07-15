@@ -19,14 +19,21 @@ from openpilot.selfdrive.controls.lib.latcontrol_pid import (
   get_civic_bosch_modified_pid_output_alpha,
   get_civic_bosch_modified_pid_output_scale,
 )
-from openpilot.selfdrive.controls.lib.latcontrol_vehicle_tunes import get_hkg_canfd_base_friction_threshold
+from openpilot.selfdrive.controls.lib.latcontrol_vehicle_tunes import (
+  clear_flm_runtime_overrides,
+  get_flm_runtime_overrides,
+  get_hkg_canfd_base_friction_threshold,
+  normalize_flm_overrides,
+  set_flm_runtime_overrides,
+)
 from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   get_civic_bosch_modified_a_center_taper_scale,
   LatControlTorque,
   get_civic_bosch_modified_b_ff_scale,
   get_civic_bosch_modified_b_friction_scale,
+  get_gm_base_friction_threshold,
   get_bolt_2017_center_taper_scale,
-  get_friction_threshold,
+  get_standard_friction_threshold,
   get_bolt_2017_base_torque_scale,
   get_bolt_2017_steer_ratio_scale,
   get_bolt_2017_torque_scale,
@@ -59,6 +66,7 @@ from openpilot.selfdrive.controls.lib.latcontrol_torque import (
   get_ioniq_6_directional_taper_scale,
   get_ioniq_6_output_taper_scale,
   get_ioniq_6_ff_scale,
+  get_ioniq_6_friction_center_fade_scale,
   get_ioniq_6_friction_scale,
   get_ioniq_6_friction_threshold,
   get_ioniq_6_low_speed_angle_assist_torque,
@@ -157,7 +165,7 @@ class TestLatControl:
     assert get_bolt_2018_2021_dynamic_torque_scale(-0.6, 0.6, 8.0) < get_bolt_2018_2021_dynamic_torque_scale(-0.6, -0.6, 8.0)
 
   def test_bolt_2018_2021_friction_threshold_curve(self):
-    base = get_friction_threshold(6.0)
+    base = get_gm_base_friction_threshold(6.0)
     left_turn_in = get_bolt_2018_2021_friction_threshold(6.0, 0.7, 0.8)
     right_turn_in = get_bolt_2018_2021_friction_threshold(6.0, -0.7, -0.8)
     left_unwind = get_bolt_2018_2021_friction_threshold(6.0, 0.7, -0.8)
@@ -186,7 +194,7 @@ class TestLatControl:
     assert get_bolt_2022_2023_ff_scale(0.14, 0.0, 30.0) < get_bolt_2022_2023_ff_scale(0.14, 0.0, 20.0)
 
   def test_bolt_2022_2023_friction_threshold_curve(self):
-    base = get_friction_threshold(6.0)
+    base = get_gm_base_friction_threshold(6.0)
     left_turn_in = get_bolt_2022_2023_friction_threshold(6.0, 0.7, 0.8)
     right_turn_in = get_bolt_2022_2023_friction_threshold(6.0, -0.7, -0.8)
     left_unwind = get_bolt_2022_2023_friction_threshold(6.0, 0.7, -0.8)
@@ -217,7 +225,7 @@ class TestLatControl:
     assert get_volt_standard_ff_scale(2.0, 0.0, 20.0) < get_volt_standard_ff_scale(0.8, 0.0, 20.0)
 
   def test_volt_standard_friction_threshold_curve(self):
-    base = get_friction_threshold(6.0)
+    base = get_gm_base_friction_threshold(6.0)
     left_turn_in = get_volt_standard_friction_threshold(6.0, 0.7, 0.8)
     right_turn_in = get_volt_standard_friction_threshold(6.0, -0.7, -0.8)
     left_unwind = get_volt_standard_friction_threshold(6.0, 0.7, -0.8)
@@ -255,6 +263,80 @@ class TestLatControl:
     assert turn_in_right > steady_right
     assert unwind_left < steady_left
     assert unwind_right < steady_right
+
+  def test_flm_standard_friction_curve_override(self):
+    base = get_standard_friction_threshold(10.0)
+    overrides = normalize_flm_overrides({
+      "baseFrictionThresholds": {
+        "standard": {
+          "values": [0.30, 0.31, 0.32, 0.33, 0.34],
+        },
+      },
+    })
+    try:
+      set_flm_runtime_overrides(overrides)
+      assert get_flm_runtime_overrides()["baseFrictionThresholds"]["standard"]["values"] == [0.30, 0.31, 0.32, 0.33, 0.34]
+      assert get_standard_friction_threshold(10.0) == pytest.approx(0.32)
+      assert get_standard_friction_threshold(12.5) > get_standard_friction_threshold(10.0)
+      assert get_standard_friction_threshold(10.0) != pytest.approx(base)
+    finally:
+      clear_flm_runtime_overrides()
+    assert get_flm_runtime_overrides() == {}
+    assert get_standard_friction_threshold(10.0) == pytest.approx(base)
+
+  def test_flm_vehicle_knob_override_ioniq6_center_taper(self):
+    baseline = get_ioniq_6_center_taper_scale(0.0, 32.0)
+    overrides = normalize_flm_overrides({
+      "vehicleKnobs": {
+        "hyundai_ioniq_6.center_taper_max": 0.0,
+        "hyundai_ioniq_6.highway_center_taper_max": 0.0,
+      },
+    })
+    try:
+      set_flm_runtime_overrides(overrides)
+      adjusted = get_ioniq_6_center_taper_scale(0.0, 32.0)
+      assert adjusted > baseline
+      assert adjusted <= 1.0
+    finally:
+      clear_flm_runtime_overrides()
+
+  @pytest.mark.parametrize(("trial_applied", "profile_id"), [(False, "profile"), (True, "")])
+  def test_flm_surface_helpers_require_active_trial(self, monkeypatch, trial_applied, profile_id):
+    controller, VM, CS, params, starpilot_toggles = self._build_torque_controller(GM.CHEVROLET_BOLT_ACC_2022_2023)
+    starpilot_toggles.flm_trial_applied = trial_applied
+    starpilot_toggles.flm_active_profile_id = profile_id
+    starpilot_toggles.flm_active_overrides = {
+      "vehicleKnobs": {"gm_bolt_2022_2023.highway_center_taper_max": 0.10},
+    }
+
+    def fail_if_called(*_args, **_kwargs):
+      raise AssertionError("inactive FLM trial reached the runtime shaping path")
+
+    monkeypatch.setattr(latcontrol_torque, "get_flm_full_surface_ff_scale", fail_if_called)
+    controller.update(True, CS, VM, params, False, 0.0025, False, 0.2, None, None, starpilot_toggles)
+
+    assert get_flm_runtime_overrides() == {}
+
+  def test_flm_surface_helpers_run_for_active_trial(self, monkeypatch):
+    controller, VM, CS, params, starpilot_toggles = self._build_torque_controller(GM.CHEVROLET_BOLT_ACC_2022_2023)
+    starpilot_toggles.flm_trial_applied = True
+    starpilot_toggles.flm_active_profile_id = "report:cleanup:recommended"
+    starpilot_toggles.flm_active_overrides = {
+      "vehicleKnobs": {"gm_bolt_2022_2023.highway_center_taper_max": 0.10},
+    }
+    calls = []
+
+    def record_call(*_args, **_kwargs):
+      calls.append(True)
+      return 1.0
+
+    monkeypatch.setattr(latcontrol_torque, "get_flm_full_surface_ff_scale", record_call)
+    try:
+      controller.update(True, CS, VM, params, False, 0.0025, False, 0.2, None, None, starpilot_toggles)
+      assert calls
+      assert get_flm_runtime_overrides()["vehicleKnobs"]["gm_bolt_2022_2023.highway_center_taper_max"] == pytest.approx(0.10)
+    finally:
+      clear_flm_runtime_overrides()
 
   def test_sonata_hybrid_center_taper_curve(self):
     assert get_sonata_hybrid_center_taper_scale(0.0, 30.0) < get_sonata_hybrid_center_taper_scale(0.0, 15.0)
@@ -329,7 +411,7 @@ class TestLatControl:
     assert get_genesis_g90_ff_scale(2.0, 0.0, 20.0) < get_genesis_g90_ff_scale(0.8, 0.0, 20.0)
 
   def test_genesis_g90_friction_threshold_curve(self):
-    base = get_friction_threshold(6.0)
+    base = get_gm_base_friction_threshold(6.0)
     left_turn_in = get_genesis_g90_friction_threshold(6.0, 0.7, 0.8)
     right_turn_in = get_genesis_g90_friction_threshold(6.0, -0.7, -0.8)
     left_unwind = get_genesis_g90_friction_threshold(6.0, 0.7, -0.8)
@@ -366,7 +448,7 @@ class TestLatControl:
     assert unwind_right < unwind_left
 
   def test_palisade_friction_threshold_curve(self):
-    base = get_friction_threshold(6.0)
+    base = get_gm_base_friction_threshold(6.0)
     left_turn_in = get_palisade_friction_threshold(6.0, 0.7, 0.8)
     right_turn_in = get_palisade_friction_threshold(6.0, -0.7, -0.8)
     left_unwind = get_palisade_friction_threshold(6.0, 0.7, -0.8)
@@ -399,7 +481,7 @@ class TestLatControl:
     assert unwind_right < unwind_left
 
   def test_prius_friction_curves(self):
-    base_threshold = get_friction_threshold(12.0)
+    base_threshold = get_gm_base_friction_threshold(12.0)
     left_turn_in_threshold = get_prius_friction_threshold(6.0, 0.7, 0.8)
     right_turn_in_threshold = get_prius_friction_threshold(6.0, -0.7, -0.8)
     left_unwind_threshold = get_prius_friction_threshold(6.0, 0.7, -0.8)
@@ -416,6 +498,11 @@ class TestLatControl:
     right_unwind_scale = get_prius_friction_scale(6.0, -0.7, 0.8)
     assert right_turn_in_scale > left_turn_in_scale > base_scale
     assert base_scale > left_unwind_scale > right_unwind_scale
+
+  def test_generic_friction_threshold_floor(self):
+    assert get_standard_friction_threshold(0.0) == 0.30
+    assert get_standard_friction_threshold(6.0) == 0.30
+    assert get_standard_friction_threshold(40.0) == 0.30
 
   def test_ioniq_5_ff_scale_curve(self):
     assert get_ioniq_5_ff_scale(0.0, 0.0, 20.0) == 1.0
@@ -503,7 +590,7 @@ class TestLatControl:
     assert get_ioniq_6_directional_taper_scale(1.2, -0.40) > get_ioniq_6_directional_taper_scale(1.2, -0.7)
     assert get_ioniq_6_directional_taper_scale(-1.2, -0.40, 8.0) > get_ioniq_6_directional_taper_scale(-1.2, -0.40, 25.0)
     assert get_ioniq_6_directional_taper_scale(1.2, 0.40, 8.0) > get_ioniq_6_directional_taper_scale(1.2, 0.40, 25.0)
-    assert get_ioniq_6_directional_taper_scale(-1.2, 0.7, 8.0) == pytest.approx(get_ioniq_6_directional_taper_scale(-1.2, 0.7, 25.0), abs=0.02)
+    assert get_ioniq_6_directional_taper_scale(-1.2, 1.6, 8.0) == pytest.approx(get_ioniq_6_directional_taper_scale(-1.2, 1.6, 25.0), abs=0.02)
     assert get_ioniq_6_directional_taper_scale(-0.18, -0.40, 3.0) > get_ioniq_6_directional_taper_scale(-0.18, -0.40, 9.0)
     assert get_ioniq_6_directional_taper_scale(-0.18, -0.40, 9.0) > get_ioniq_6_directional_taper_scale(-0.18, -0.40, 20.0)
     assert get_ioniq_6_directional_taper_scale(-0.50, -0.40, 3.0) > get_ioniq_6_directional_taper_scale(-0.50, -0.40, 6.0)
@@ -540,6 +627,15 @@ class TestLatControl:
     assert right_turn_in >= left_turn_in > base
     assert base > left_unwind >= right_unwind
 
+  def test_ioniq_6_friction_center_fade_curve(self):
+    # fades friction near zero lateral accel at highway speed, inactive at city speed and in turns
+    assert get_ioniq_6_friction_center_fade_scale(0.0, 30.0) < get_ioniq_6_friction_center_fade_scale(0.0, 8.0)
+    assert get_ioniq_6_friction_center_fade_scale(0.0, 30.0) < get_ioniq_6_friction_center_fade_scale(0.5, 30.0)
+    assert get_ioniq_6_friction_center_fade_scale(0.0, 30.0) >= 0.5
+    assert get_ioniq_6_friction_center_fade_scale(0.5, 30.0) > 0.95
+    assert get_ioniq_6_friction_center_fade_scale(-0.5, 30.0) > 0.95
+    assert get_ioniq_6_friction_center_fade_scale(0.0, 8.0) > 0.95
+
   def test_ioniq_6_center_taper_curve(self):
     assert get_ioniq_6_center_taper_scale(0.0, 10.0) > get_ioniq_6_center_taper_scale(0.0, 30.0)
     assert get_ioniq_6_center_taper_scale(0.0, 30.0) < get_ioniq_6_center_taper_scale(0.2, 30.0)
@@ -575,7 +671,7 @@ class TestLatControl:
     assert base > left_unwind >= right_unwind
 
   def test_volt_plexy_friction_threshold_curve(self):
-    base = get_friction_threshold(6.0)
+    base = get_gm_base_friction_threshold(6.0)
     left_turn_in = get_volt_plexy_friction_threshold(6.0, 0.7, 0.8)
     right_turn_in = get_volt_plexy_friction_threshold(6.0, -0.7, -0.8)
     left_unwind = get_volt_plexy_friction_threshold(6.0, 0.7, -0.8)

@@ -85,6 +85,12 @@ STABLE_FOLLOW_CRUISE_MIN_HEADWAY = 0.95
 STABLE_FOLLOW_CRUISE_HEADWAY_BELOW_TARGET = 0.35
 STABLE_FOLLOW_CRUISE_HEADWAY_ABOVE_TARGET = 0.90
 STABLE_FOLLOW_CRUISE_MAX_LEAD_BRAKE = 0.35
+STABLE_FOLLOW_CRUISE_PULLAWAY_MAX_REL_SPEED = 2.0
+STABLE_FOLLOW_CRUISE_PULLAWAY_MAX_HEADWAY_MARGIN = 0.35
+STABLE_FOLLOW_CRUISE_PULLAWAY_MIN_HEADWAY_MARGIN = -0.10
+STABLE_FOLLOW_CRUISE_PULLAWAY_HYSTERESIS_MAX = 1.75
+VISION_FOLLOW_CRUISE_HOLD_MIN_MODEL_PROB = 0.95
+VISION_FOLLOW_CRUISE_HOLD_MAX_CRUISE_ADVANTAGE = 2.0
 NEAR_DUPLICATE_LEAD_SOURCE_MIN_SPEED = 20.0
 NEAR_DUPLICATE_IDENTICAL_RADAR_SOURCE_MIN_SPEED = 10.0
 NEAR_DUPLICATE_LEAD_SOURCE_MIN_MODEL_PROB = 0.9
@@ -596,6 +602,8 @@ class LongitudinalMpc:
       return 0.0
 
     lead_radar = bool(getattr(lead, "radar", False))
+    relative_speed = float(v_ego) - float(lead.vLead)
+    actual_headway = None
     lead_brake = max(0.0, -float(getattr(lead, "aLeadK", 0.0)))
     if lead_brake > STABLE_FOLLOW_CRUISE_MAX_LEAD_BRAKE:
       return 0.0
@@ -603,7 +611,6 @@ class LongitudinalMpc:
     if lead_radar:
       if float(t_follow) <= 0.0 or float(v_ego) < STABLE_FOLLOW_CRUISE_MIN_SPEED:
         return 0.0
-      relative_speed = float(v_ego) - float(lead.vLead)
       if abs(relative_speed) > STABLE_FOLLOW_CRUISE_MAX_REL_SPEED:
         return 0.0
 
@@ -624,9 +631,23 @@ class LongitudinalMpc:
       min_speed=STABLE_FOLLOW_CRUISE_MIN_SPEED,
     ):
       return 0.0
+    actual_headway = float(lead.dRel) / max(float(v_ego), 1e-3)
 
-    return max(STABLE_FOLLOW_CRUISE_HYSTERESIS_MIN,
-               STABLE_FOLLOW_CRUISE_HYSTERESIS_GAIN * float(v_ego))
+    hysteresis = max(STABLE_FOLLOW_CRUISE_HYSTERESIS_MIN,
+                     STABLE_FOLLOW_CRUISE_HYSTERESIS_GAIN * float(v_ego))
+
+    if relative_speed < 0.0:
+      headway_margin = actual_headway - float(t_follow)
+      if headway_margin <= STABLE_FOLLOW_CRUISE_PULLAWAY_MAX_HEADWAY_MARGIN:
+        rel_speed_factor = float(np.clip((-relative_speed) / STABLE_FOLLOW_CRUISE_PULLAWAY_MAX_REL_SPEED, 0.0, 1.0))
+        headway_factor = float(np.clip(
+          (STABLE_FOLLOW_CRUISE_PULLAWAY_MAX_HEADWAY_MARGIN - headway_margin) /
+          max(STABLE_FOLLOW_CRUISE_PULLAWAY_MAX_HEADWAY_MARGIN - STABLE_FOLLOW_CRUISE_PULLAWAY_MIN_HEADWAY_MARGIN, 1e-3),
+          0.0, 1.0,
+        ))
+        hysteresis += STABLE_FOLLOW_CRUISE_PULLAWAY_HYSTERESIS_MAX * rel_speed_factor * headway_factor
+
+    return hysteresis
 
   @staticmethod
   def leads_share_identical_radar_track(lead_one, lead_two):
@@ -724,6 +745,27 @@ class LongitudinalMpc:
     prev_lead_obstacle = float(lead_0_obstacle if prev_source == "lead0" else lead_1_obstacle)
     cruise_advantage = prev_lead_obstacle - float(cruise_obstacle)
     if cruise_advantage > IDENTICAL_RADAR_DUPLICATE_CRUISE_HOLD_MAX_CRUISE_ADVANTAGE:
+      return None
+
+    return prev_source
+
+  def get_vision_follow_cruise_hold(self, prev_source, lead_one, lead_two,
+                                    lead_0_obstacle, lead_1_obstacle, cruise_obstacle,
+                                    v_ego, t_follow, tracking_lead):
+    if not tracking_lead or prev_source not in ("lead0", "lead1"):
+      return None
+
+    prev_lead = lead_one if prev_source == "lead0" else lead_two
+    if prev_lead is None or not prev_lead.status or bool(getattr(prev_lead, "radar", False)):
+      return None
+    if float(getattr(prev_lead, "modelProb", 0.0)) < VISION_FOLLOW_CRUISE_HOLD_MIN_MODEL_PROB:
+      return None
+    if self.get_stable_follow_cruise_hysteresis(prev_lead, v_ego, t_follow) <= 0.0:
+      return None
+
+    prev_lead_obstacle = float(lead_0_obstacle if prev_source == "lead0" else lead_1_obstacle)
+    cruise_advantage = prev_lead_obstacle - float(cruise_obstacle)
+    if cruise_advantage > VISION_FOLLOW_CRUISE_HOLD_MAX_CRUISE_ADVANTAGE:
       return None
 
     return prev_source
@@ -843,6 +885,18 @@ class LongitudinalMpc:
             v_ego,
             t_follow,
           )
+          if sticky_source is None:
+            sticky_source = self.get_vision_follow_cruise_hold(
+              prev_source,
+              lead_one,
+              lead_two,
+              lead_0_obstacle[0],
+              lead_1_obstacle[0],
+              cruise_obstacle[0],
+              v_ego,
+              t_follow,
+              tracking_lead,
+            )
       self.source = sticky_source or candidate_source
 
       # These are not used in ACC mode
